@@ -1,111 +1,108 @@
 /*
  * transmitter.ino — ESP32 Pan-Tilt Head Transmitter
  *
- * Reads a joystick (rate-control) and a reset button, then sends
- * PanTiltPacket structs to the receiver via ESP-NOW.
+ * Reads two potentiometers (pan and tilt) and sends their mapped
+ * positions to the receiver via ESP-NOW.
  *
  * SETUP:
- *   1. Flash receiver.ino first and note the MAC printed on Serial.
- *   2. Replace RECEIVER_MAC below with the actual receiver MAC.
+ *   1. Flash receiver.ino first.
+ *   2. Verify receiver MAC matches RECEIVER_MAC below.
  *   3. Flash this sketch.
  *
  * WIRING:
- *   Joystick X (pan)  → GPIO36 (ADC1_CH0)
- *   Joystick Y (tilt) → GPIO39 (ADC1_CH3)
- *   Joystick VCC      → 3.3V
- *   Joystick GND      → GND
- *   Reset button      → GPIO15 + GND  (internal pull-up; active LOW)
+ *   Pan potentiometer  → GPIO34 (ADC input)
+ *   Tilt potentiometer → GPIO35 (ADC input)
+ *   Potentiometer VCC  → 3.3V
+ *   Potentiometer GND  → GND
  */
 
 #include <WiFi.h>
 #include <esp_now.h>
 
 // ---------------------------------------------------------------------------
-// *** CHANGE THIS to your receiver's MAC address ***
+// *** Receiver MAC address (must match receiver's hardcoded MAC) ***
 // ---------------------------------------------------------------------------
-static uint8_t RECEIVER_MAC[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+static uint8_t RECEIVER_MAC[6] = {0x08, 0xB6, 0x1F, 0xB8, 0xA3, 0xD0};
 
 // ---------------------------------------------------------------------------
 // Pin & timing constants
 // ---------------------------------------------------------------------------
-static constexpr int PIN_JOY_PAN = 36;  // ADC1_CH0 — input only, no pull
-static constexpr int PIN_JOY_TILT = 39; // ADC1_CH3 — input only, no pull
-static constexpr int PIN_RESET_BTN = 15;
+static constexpr int PIN_POT_PAN = 34;  // ADC input for pan pot
+static constexpr int PIN_POT_TILT = 35; // ADC input for tilt pot
 
-static constexpr int TX_INTERVAL_MS = 20; // send rate (50 Hz)
+static constexpr int TX_INTERVAL_MS = 50; // send rate (20 Hz)
 
-// ADC is 12-bit: 0–4095, center ≈ 2048
-static constexpr int ADC_CENTER = 2048;
-static constexpr int ADC_MAX_RANGE = 2048; // distance from center to rail
-static constexpr int DEADZONE = 200;       // raw ADC counts around center
+// ADC is 12-bit: 0–4095, map to servo range 0–180°
+static constexpr int ADC_MIN = 0;
+static constexpr int ADC_MAX = 4095;
+static constexpr int SERVO_MIN = 0;
+static constexpr int SERVO_MAX = 180;
 
-// Button debounce
-static constexpr uint32_t DEBOUNCE_MS = 30;
+// Moving average filter to reduce noise (number of samples to average)
+static constexpr int FILTER_SIZE = 5;
 
 // ---------------------------------------------------------------------------
 // Shared packet struct — must match receiver.ino exactly
 // ---------------------------------------------------------------------------
 typedef struct __attribute__((packed))
 {
-    int8_t pan_speed;  // -100 to 100
-    int8_t tilt_speed; // -100 to 100
-    bool reset;
+    uint8_t pan_pos;  // 0 to 180 (servo angle in degrees)
+    uint8_t tilt_pos; // 0 to 180 (servo angle in degrees)
 } PanTiltPacket;
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-// Map raw ADC value to speed in [-100, 100] with deadzone.
-int8_t adcToSpeed(int raw)
+// Simple moving average filter to reduce ADC noise
+class MovingAverageFilter
 {
-    int offset = raw - ADC_CENTER;
-    if (abs(offset) < DEADZONE)
-        return 0;
+private:
+    int buffer[FILTER_SIZE];
+    int index = 0;
+    int sum = 0;
+    bool filled = false;
 
-    // Remove deadzone: shrink the live range to start at 0
-    int sign = (offset > 0) ? 1 : -1;
-    int magnitude = abs(offset) - DEADZONE;
-    int liveRange = ADC_MAX_RANGE - DEADZONE; // effective travel
-
-    int speed = (magnitude * 100) / liveRange;
-    speed = constrain(speed, 0, 100) * sign;
-    return (int8_t)speed;
-}
-
-// Debounced button read — returns true on the falling edge (press).
-bool buttonPressed()
-{
-    static bool lastState = HIGH;
-    static uint32_t lastChangeMs = 0;
-    static bool stableState = HIGH;
-
-    bool reading = digitalRead(PIN_RESET_BTN);
-    uint32_t now = millis();
-
-    if (reading != lastState)
+public:
+    MovingAverageFilter()
     {
-        lastChangeMs = now;
-        lastState = reading;
+        for (int i = 0; i < FILTER_SIZE; i++)
+            buffer[i] = 0;
     }
 
-    if ((now - lastChangeMs) > DEBOUNCE_MS)
+    int update(int newValue)
     {
-        if (stableState == HIGH && reading == LOW)
-        {
-            stableState = LOW;
-            return true; // falling edge — button just pressed
-        }
-        if (stableState == LOW && reading == HIGH)
-        {
-            stableState = HIGH;
-        }
+        if (filled)
+            sum -= buffer[index];
+
+        buffer[index] = newValue;
+        sum += newValue;
+        index = (index + 1) % FILTER_SIZE;
+
+        if (!filled && index == 0)
+            filled = true;
+
+        return sum / FILTER_SIZE;
     }
-    return false;
+};
+
+// Global filter instances
+MovingAverageFilter panFilter;
+MovingAverageFilter tiltFilter;
+
+// Map raw ADC value (0-4095) to servo position (0-180).
+uint8_t adcToServoPos(int raw)
+{
+    // Constrain to valid ADC range
+    raw = constrain(raw, ADC_MIN, ADC_MAX);
+
+    // Linear mapping: ADC_MIN → SERVO_MIN, ADC_MAX → SERVO_MAX
+    int pos = map(raw, ADC_MIN, ADC_MAX, SERVO_MIN, SERVO_MAX);
+    return (uint8_t)constrain(pos, SERVO_MIN, SERVO_MAX);
 }
 
 // ESP-NOW send callback — logs errors if the peer did not acknowledge.
-void onDataSent(const uint8_t *mac, esp_now_send_status_t status)
+void onDataSent(const wifi_tx_info_t *info, esp_now_send_status_t status)
 {
     if (status != ESP_NOW_SEND_SUCCESS)
     {
@@ -119,13 +116,19 @@ void onDataSent(const uint8_t *mac, esp_now_send_status_t status)
 void setup()
 {
     Serial.begin(115200);
+    delay(500);
 
-    pinMode(PIN_RESET_BTN, INPUT_PULLUP);
-    // ADC pins (36, 39) are input-only; no pinMode needed
+    // ADC pins (14, 15) are input; no pinMode needed, but we can set them anyway
+    pinMode(PIN_POT_PAN, INPUT);
+    pinMode(PIN_POT_TILT, INPUT);
 
     WiFi.mode(WIFI_STA);
     Serial.print("[TX] Transmitter MAC: ");
     Serial.println(WiFi.macAddress());
+    Serial.print("[TX] Target receiver MAC: ");
+    Serial.printf("%02X:%02X:%02X:%02X:%02X:%02X\n",
+                  RECEIVER_MAC[0], RECEIVER_MAC[1], RECEIVER_MAC[2],
+                  RECEIVER_MAC[3], RECEIVER_MAC[4], RECEIVER_MAC[5]);
 
     if (esp_now_init() != ESP_OK)
     {
@@ -161,26 +164,23 @@ void loop()
         return;
     lastTxMs = now;
 
+    // Read potentiometers and apply moving average filter
+    int rawPan = analogRead(PIN_POT_PAN);
+    int rawTilt = analogRead(PIN_POT_TILT);
+
+    int filteredPan = panFilter.update(rawPan);
+    int filteredTilt = tiltFilter.update(rawTilt);
+
+    uint8_t panPos = adcToServoPos(filteredPan);
+    uint8_t tiltPos = adcToServoPos(filteredTilt);
+
+    // Build and send packet
     PanTiltPacket pkt;
-    pkt.reset = buttonPressed();
-
-    if (pkt.reset)
-    {
-        pkt.pan_speed = 0;
-        pkt.tilt_speed = 0;
-        Serial.println("[TX] Reset button pressed.");
-    }
-    else
-    {
-        int rawPan = analogRead(PIN_JOY_PAN);
-        int rawTilt = analogRead(PIN_JOY_TILT);
-
-        pkt.pan_speed = adcToSpeed(rawPan);
-        pkt.tilt_speed = adcToSpeed(rawTilt);
-
-        Serial.printf("[TX] raw=(%4d,%4d)  spd=(%4d,%4d)\n",
-                      rawPan, rawTilt, pkt.pan_speed, pkt.tilt_speed);
-    }
+    pkt.pan_pos = panPos;
+    pkt.tilt_pos = tiltPos;
 
     esp_now_send(RECEIVER_MAC, (uint8_t *)&pkt, sizeof(pkt));
+
+    Serial.printf("[TX] raw=(%4d,%4d) filt=(%4d,%4d) pos=(%3d°,%3d°)\n",
+                  rawPan, rawTilt, filteredPan, filteredTilt, panPos, tiltPos);
 }

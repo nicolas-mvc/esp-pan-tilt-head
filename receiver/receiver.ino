@@ -2,18 +2,20 @@
  * receiver.ino — ESP32 Pan-Tilt Head Receiver
  *
  * Receives PanTiltPacket via ESP-NOW from the transmitter and drives
- * two servos in rate-control mode (joystick deflection = movement speed).
+ * two servos to the specified positions directly (potentiometer control).
+ * Turns on blue built-in LED when connected.
  *
  * SETUP:
  *   1. Flash this sketch first.
- *   2. Open Serial Monitor at 115200 baud.
- *   3. Copy the printed MAC address into transmitter.ino.
+ *   2. Open Serial Monitor at 115200 baud to verify MAC address.
+ *   3. Ensure transmitter has this receiver's MAC address hardcoded.
  *
  * WIRING:
- *   Pan  servo signal → GPIO18
- *   Tilt servo signal → GPIO19
+ *   Pan  servo signal → GPIO14
+ *   Tilt servo signal → GPIO15
  *   Servo VCC         → external 5V rail (NOT the ESP32 3.3V pin)
  *   Servo GND         → common GND with ESP32
+ *   Built-in LED      → GPIO2 (usually on-board)
  *
  * LIBRARY:
  *   Install "ESP32Servo" from the Arduino Library Manager.
@@ -24,26 +26,24 @@
 #include <ESP32Servo.h>
 
 // ---------------------------------------------------------------------------
-// Tuning constants
+// Pin constants
 // ---------------------------------------------------------------------------
-static constexpr int PIN_PAN = 18;
-static constexpr int PIN_TILT = 19;
+static constexpr int PIN_PAN = 14;
+static constexpr int PIN_TILT = 15;
+static constexpr int PIN_LED = 2; // Built-in LED
 
-// Maximum degrees per second at full joystick deflection (speed = ±100).
-// Increase to make movement faster, decrease to make it more precise.
-static constexpr float DEG_PER_SEC = 90.0f; // °/s at full stick
-
-static constexpr int LOOP_MS = 10;     // main loop period (ms)
-static constexpr float CENTER = 90.0f; // reset / home position (°)
+// ---------------------------------------------------------------------------
+// Receiver MAC address (hardcoded)
+// ---------------------------------------------------------------------------
+static const uint8_t RECEIVER_MAC[6] = {0x08, 0xB6, 0x1F, 0xB8, 0xA3, 0xD0};
 
 // ---------------------------------------------------------------------------
 // Shared packet struct — must match transmitter.ino exactly
 // ---------------------------------------------------------------------------
 typedef struct __attribute__((packed))
 {
-    int8_t pan_speed;  // -100 to 100
-    int8_t tilt_speed; // -100 to 100
-    bool reset;
+    uint8_t pan_pos;  // 0 to 180 (servo angle in degrees)
+    uint8_t tilt_pos; // 0 to 180 (servo angle in degrees)
 } PanTiltPacket;
 
 // ---------------------------------------------------------------------------
@@ -54,9 +54,9 @@ Servo tiltServo;
 
 volatile PanTiltPacket rxPacket;
 volatile bool newData = false;
-
-float panPos = CENTER;
-float tiltPos = CENTER;
+volatile bool connected = false;
+volatile uint32_t lastPacketMs = 0;
+static constexpr uint32_t CONNECTION_TIMEOUT_MS = 1000; // timeout after 1 sec of no packets
 
 // ---------------------------------------------------------------------------
 // ESP-NOW receive callback (runs in WiFi task context)
@@ -67,6 +67,7 @@ void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len)
         return;
     memcpy((void *)&rxPacket, data, sizeof(PanTiltPacket));
     newData = true;
+    lastPacketMs = millis();
 }
 
 // ---------------------------------------------------------------------------
@@ -75,11 +76,20 @@ void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len)
 void setup()
 {
     Serial.begin(115200);
+    delay(500);
 
-    // Print own MAC so it can be hardcoded in the transmitter
+    // Configure LED
+    pinMode(PIN_LED, OUTPUT);
+    digitalWrite(PIN_LED, LOW); // LED off initially
+
+    // Print own MAC so it can be verified
     WiFi.mode(WIFI_STA);
     Serial.print("[Receiver] MAC address: ");
     Serial.println(WiFi.macAddress());
+    Serial.print("[Receiver] Expected MAC: ");
+    Serial.printf("%02X:%02X:%02X:%02X:%02X:%02X\n",
+                  RECEIVER_MAC[0], RECEIVER_MAC[1], RECEIVER_MAC[2],
+                  RECEIVER_MAC[3], RECEIVER_MAC[4], RECEIVER_MAC[5]);
 
     // Init ESP-NOW
     if (esp_now_init() != ESP_OK)
@@ -94,8 +104,10 @@ void setup()
     // Attach servos
     panServo.attach(PIN_PAN, 500, 2400);
     tiltServo.attach(PIN_TILT, 500, 2400);
-    panServo.write((int)panPos);
-    tiltServo.write((int)tiltPos);
+    panServo.write(90); // Center position
+    tiltServo.write(90);
+
+    lastPacketMs = millis();
 }
 
 // ---------------------------------------------------------------------------
@@ -103,45 +115,44 @@ void setup()
 // ---------------------------------------------------------------------------
 void loop()
 {
-    static uint32_t lastMs = 0;
+    // Check connection timeout
     uint32_t now = millis();
-    uint32_t elapsed = now - lastMs;
-    if (elapsed < (uint32_t)LOOP_MS)
-        return;
-    lastMs = now;
+    bool wasConnected = connected;
+    connected = (now - lastPacketMs) < CONNECTION_TIMEOUT_MS;
 
-    // Snapshot volatile packet with interrupts disabled briefly
-    PanTiltPacket pkt;
-    noInterrupts();
-    pkt = rxPacket;
-    bool nd = newData;
-    newData = false;
-    interrupts();
-
-    if (nd)
+    if (connected != wasConnected)
     {
-        if (pkt.reset)
+        if (connected)
         {
-            panPos = CENTER;
-            tiltPos = CENTER;
-            Serial.println("[Receiver] Reset to center.");
+            digitalWrite(PIN_LED, HIGH); // Turn LED on
+            Serial.println("[Receiver] Connected!");
         }
         else
         {
-            // Rate integration: deg = speed_fraction * DEG_PER_SEC * dt_sec
-            float dt = elapsed / 1000.0f;
-            panPos += (pkt.pan_speed / 100.0f) * DEG_PER_SEC * dt;
-            tiltPos += (pkt.tilt_speed / 100.0f) * DEG_PER_SEC * dt;
-
-            // Clamp to valid servo range
-            panPos = constrain(panPos, 0.0f, 180.0f);
-            tiltPos = constrain(tiltPos, 0.0f, 180.0f);
-
-            Serial.printf("[Receiver] spd=(%4d,%4d)  pos=(%.1f°, %.1f°)\n",
-                          pkt.pan_speed, pkt.tilt_speed, panPos, tiltPos);
+            digitalWrite(PIN_LED, LOW); // Turn LED off
+            Serial.println("[Receiver] Connection lost.");
         }
-
-        panServo.write((int)panPos);
-        tiltServo.write((int)tiltPos);
     }
+
+    // Process received packet
+    if (newData)
+    {
+        newData = false;
+
+        PanTiltPacket pkt;
+        noInterrupts();
+        memcpy(&pkt, (const void *)&rxPacket, sizeof(pkt));
+        interrupts();
+
+        // Constrain positions to valid servo range
+        uint8_t panPos = constrain(pkt.pan_pos, 0, 180);
+        uint8_t tiltPos = constrain(pkt.tilt_pos, 0, 180);
+
+        panServo.write(panPos);
+        tiltServo.write(tiltPos);
+
+        Serial.printf("[Receiver] pos=(%3d°, %3d°)\n", panPos, tiltPos);
+    }
+
+    delay(10);
 }
