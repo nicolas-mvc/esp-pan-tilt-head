@@ -30,24 +30,24 @@ static uint8_t RECEIVER_MAC[6] = {0x08, 0xB6, 0x1F, 0xB8, 0xA3, 0xD0};
 static constexpr int PIN_POT_PAN = 34;  // ADC input for pan pot
 static constexpr int PIN_POT_TILT = 35; // ADC input for tilt pot
 
-static constexpr int TX_INTERVAL_MS = 50; // send rate (20 Hz)
+static constexpr int TX_INTERVAL_MS = 20; // send rate (50 Hz)
 
-// ADC is 12-bit: 0–4095, map to servo range 0–180°
+// ADC is 12-bit: 0–4095, map to servo pulse width range 1000–2000 µs
 static constexpr int ADC_MIN = 0;
 static constexpr int ADC_MAX = 4095;
-static constexpr int SERVO_MIN = 0;
-static constexpr int SERVO_MAX = 180;
+static constexpr int PULSE_MIN = 550;  // microseconds (0°)
+static constexpr int PULSE_MAX = 2650; // microseconds (180°)
 
 // Moving average filter to reduce noise (number of samples to average)
-static constexpr int FILTER_SIZE = 5;
+static constexpr int FILTER_SIZE = 9;
 
 // ---------------------------------------------------------------------------
 // Shared packet struct — must match receiver.ino exactly
 // ---------------------------------------------------------------------------
 typedef struct __attribute__((packed))
 {
-    uint8_t pan_pos;  // 0 to 180 (servo angle in degrees)
-    uint8_t tilt_pos; // 0 to 180 (servo angle in degrees)
+    uint16_t pan_us;  // 1000–2000 microseconds (pulse width)
+    uint16_t tilt_us; // 1000–2000 microseconds (pulse width)
 } PanTiltPacket;
 
 // ---------------------------------------------------------------------------
@@ -90,15 +90,15 @@ public:
 MovingAverageFilter panFilter;
 MovingAverageFilter tiltFilter;
 
-// Map raw ADC value (0-4095) to servo position (0-180).
-uint8_t adcToServoPos(int raw)
+// Map raw ADC value (0-4095) to servo pulse width (1000-2000 µs).
+uint16_t adcToPulseWidth(int raw)
 {
     // Constrain to valid ADC range
     raw = constrain(raw, ADC_MIN, ADC_MAX);
 
-    // Linear mapping: ADC_MIN → SERVO_MIN, ADC_MAX → SERVO_MAX
-    int pos = map(raw, ADC_MIN, ADC_MAX, SERVO_MIN, SERVO_MAX);
-    return (uint8_t)constrain(pos, SERVO_MIN, SERVO_MAX);
+    // Linear mapping: ADC_MIN → PULSE_MIN, ADC_MAX → PULSE_MAX
+    int pulseWidth = map(raw, ADC_MIN, ADC_MAX, PULSE_MIN, PULSE_MAX);
+    return (uint16_t)constrain(pulseWidth, PULSE_MIN, PULSE_MAX);
 }
 
 // ESP-NOW send callback — logs errors if the peer did not acknowledge.
@@ -171,16 +171,16 @@ void loop()
     int filteredPan = panFilter.update(rawPan);
     int filteredTilt = tiltFilter.update(rawTilt);
 
-    uint8_t panPos = adcToServoPos(filteredPan);
-    uint8_t tiltPos = adcToServoPos(filteredTilt);
+    uint16_t panUs = adcToPulseWidth(filteredPan);
+    uint16_t tiltUs = adcToPulseWidth(filteredTilt);
 
     // Build and send packet
     PanTiltPacket pkt;
-    pkt.pan_pos = panPos;
-    pkt.tilt_pos = tiltPos;
+    pkt.pan_us = panUs;
+    pkt.tilt_us = tiltUs;
 
     esp_now_send(RECEIVER_MAC, (uint8_t *)&pkt, sizeof(pkt));
 
-    Serial.printf("[TX] raw=(%4d,%4d) filt=(%4d,%4d) pos=(%3d°,%3d°)\n",
-                  rawPan, rawTilt, filteredPan, filteredTilt, panPos, tiltPos);
+    Serial.printf("[TX] raw=(%4d,%4d) filt=(%4d,%4d) us=(%4d,%4d)\n",
+                  rawPan, rawTilt, filteredPan, filteredTilt, panUs, tiltUs);
 }

@@ -42,8 +42,8 @@ static const uint8_t RECEIVER_MAC[6] = {0x08, 0xB6, 0x1F, 0xB8, 0xA3, 0xD0};
 // ---------------------------------------------------------------------------
 typedef struct __attribute__((packed))
 {
-    uint8_t pan_pos;  // 0 to 180 (servo angle in degrees)
-    uint8_t tilt_pos; // 0 to 180 (servo angle in degrees)
+    uint16_t pan_us;  // 1000–2000 microseconds (pulse width)
+    uint16_t tilt_us; // 1000–2000 microseconds (pulse width)
 } PanTiltPacket;
 
 // ---------------------------------------------------------------------------
@@ -102,10 +102,10 @@ void setup()
     Serial.println("[Receiver] ESP-NOW ready, waiting for packets...");
 
     // Attach servos
-    panServo.attach(PIN_PAN, 500, 2400);
-    tiltServo.attach(PIN_TILT, 500, 2400);
-    panServo.write(90); // Center position
-    tiltServo.write(90);
+    panServo.attach(PIN_PAN, 550, 2650);
+    tiltServo.attach(PIN_TILT, 550, 2650);
+    panServo.writeMicroseconds(1600); // Center position (1500 µs = 90°)
+    tiltServo.writeMicroseconds(1600);
 
     lastPacketMs = millis();
 }
@@ -144,14 +144,14 @@ void loop()
         memcpy(&pkt, (const void *)&rxPacket, sizeof(pkt));
         interrupts();
 
-        // Constrain positions to valid servo range
-        uint8_t panPos = constrain(pkt.pan_pos, 0, 180);
-        uint8_t tiltPos = constrain(pkt.tilt_pos, 0, 180);
+        // Constrain pulse widths to valid servo range
+        uint16_t panUs = constrain(pkt.pan_us, 550, 2650);
+        uint16_t tiltUs = constrain(pkt.tilt_us, 550, 2650);
 
-        panServo.write(panPos);
-        tiltServo.write(tiltPos);
+        panServo.writeMicroseconds(panUs);
+        tiltServo.writeMicroseconds(tiltUs);
 
-        Serial.printf("[Receiver] pos=(%3d°, %3d°)\n", panPos, tiltPos);
+        Serial.printf("[Receiver] us=(%4d, %4d)\n", panUs, tiltUs);
     }
 
     delay(10);
