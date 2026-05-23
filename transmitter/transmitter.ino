@@ -39,7 +39,11 @@ static constexpr int PULSE_MIN = 550;  // microseconds (0°)
 static constexpr int PULSE_MAX = 2650; // microseconds (180°)
 
 // Moving average filter to reduce noise (number of samples to average)
-static constexpr int FILTER_SIZE = 9;
+static constexpr int FILTER_SIZE = 21;
+
+// Deadband in pulse-width units: the output must move by at least this much
+// before the transmitter treats it as a real change.
+static constexpr int DEADBAND_US = 8;
 
 // ---------------------------------------------------------------------------
 // Shared packet struct — must match receiver.ino exactly
@@ -86,9 +90,35 @@ public:
     }
 };
 
+// Statefully suppress tiny output changes so jitter does not get transmitted.
+class DeadbandFilter
+{
+private:
+    int lastValue = 0;
+    bool initialized = false;
+
+public:
+    int update(int newValue)
+    {
+        if (!initialized)
+        {
+            lastValue = newValue;
+            initialized = true;
+            return lastValue;
+        }
+
+        if (abs(newValue - lastValue) >= DEADBAND_US)
+            lastValue = newValue;
+
+        return lastValue;
+    }
+};
+
 // Global filter instances
 MovingAverageFilter panFilter;
 MovingAverageFilter tiltFilter;
+DeadbandFilter panDeadband;
+DeadbandFilter tiltDeadband;
 
 // Map raw ADC value (0-4095) to servo pulse width (1000-2000 µs).
 uint16_t adcToPulseWidth(int raw)
@@ -171,8 +201,8 @@ void loop()
     int filteredPan = panFilter.update(rawPan);
     int filteredTilt = tiltFilter.update(rawTilt);
 
-    uint16_t panUs = adcToPulseWidth(filteredPan);
-    uint16_t tiltUs = adcToPulseWidth(filteredTilt);
+    uint16_t panUs = (uint16_t)panDeadband.update(adcToPulseWidth(filteredPan));
+    uint16_t tiltUs = (uint16_t)tiltDeadband.update(adcToPulseWidth(filteredTilt));
 
     // Build and send packet
     PanTiltPacket pkt;
@@ -181,6 +211,6 @@ void loop()
 
     esp_now_send(RECEIVER_MAC, (uint8_t *)&pkt, sizeof(pkt));
 
-    Serial.printf("[TX] raw=(%4d,%4d) filt=(%4d,%4d) us=(%4d,%4d)\n",
+    Serial.printf("[TX] raw=(%4d,%4d) filt=(%4d,%4d) stable=(%4d,%4d)\n",
                   rawPan, rawTilt, filteredPan, filteredTilt, panUs, tiltUs);
 }
