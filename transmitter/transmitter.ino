@@ -41,6 +41,9 @@ static constexpr int PULSE_MAX = 2650; // microseconds (180°)
 // Moving average filter to reduce noise (number of samples to average)
 static constexpr int FILTER_SIZE = 21;
 
+// Shorter moving average after the deadband to smooth the final output.
+static constexpr int OUTPUT_FILTER_SIZE = 21;
+
 // Deadband in pulse-width units: the output must move by at least this much
 // before the transmitter treats it as a real change.
 static constexpr int DEADBAND_US = 8;
@@ -114,11 +117,46 @@ public:
     }
 };
 
+// Secondary moving average to soften jumps after the deadband has locked
+// onto a new value.
+class OutputMovingAverageFilter
+{
+private:
+    int buffer[OUTPUT_FILTER_SIZE];
+    int index = 0;
+    int sum = 0;
+    bool filled = false;
+
+public:
+    OutputMovingAverageFilter()
+    {
+        for (int i = 0; i < OUTPUT_FILTER_SIZE; i++)
+            buffer[i] = 0;
+    }
+
+    int update(int newValue)
+    {
+        if (filled)
+            sum -= buffer[index];
+
+        buffer[index] = newValue;
+        sum += newValue;
+        index = (index + 1) % OUTPUT_FILTER_SIZE;
+
+        if (!filled && index == 0)
+            filled = true;
+
+        return sum / OUTPUT_FILTER_SIZE;
+    }
+};
+
 // Global filter instances
 MovingAverageFilter panFilter;
 MovingAverageFilter tiltFilter;
 DeadbandFilter panDeadband;
 DeadbandFilter tiltDeadband;
+OutputMovingAverageFilter panOutputFilter;
+OutputMovingAverageFilter tiltOutputFilter;
 
 // Map raw ADC value (0-4095) to servo pulse width (1000-2000 µs).
 uint16_t adcToPulseWidth(int raw)
@@ -201,8 +239,11 @@ void loop()
     int filteredPan = panFilter.update(rawPan);
     int filteredTilt = tiltFilter.update(rawTilt);
 
-    uint16_t panUs = (uint16_t)panDeadband.update(adcToPulseWidth(filteredPan));
-    uint16_t tiltUs = (uint16_t)tiltDeadband.update(adcToPulseWidth(filteredTilt));
+    int panStableUs = panDeadband.update(adcToPulseWidth(filteredPan));
+    int tiltStableUs = tiltDeadband.update(adcToPulseWidth(filteredTilt));
+
+    uint16_t panUs = (uint16_t)panOutputFilter.update(panStableUs);
+    uint16_t tiltUs = (uint16_t)tiltOutputFilter.update(tiltStableUs);
 
     // Build and send packet
     PanTiltPacket pkt;
@@ -211,6 +252,6 @@ void loop()
 
     esp_now_send(RECEIVER_MAC, (uint8_t *)&pkt, sizeof(pkt));
 
-    Serial.printf("[TX] raw=(%4d,%4d) filt=(%4d,%4d) stable=(%4d,%4d)\n",
-                  rawPan, rawTilt, filteredPan, filteredTilt, panUs, tiltUs);
+    Serial.printf("[TX] raw=(%4d,%4d) filt=(%4d,%4d) stable=(%4d,%4d) out=(%4d,%4d)\n",
+                  rawPan, rawTilt, filteredPan, filteredTilt, panStableUs, tiltStableUs, panUs, tiltUs);
 }
