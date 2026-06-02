@@ -32,17 +32,19 @@ static constexpr int PIN_POT_TILT = 35; // ADC input for tilt pot
 
 static constexpr int TX_INTERVAL_MS = 20; // send rate (50 Hz)
 
-// ADC is 12-bit: 0–4095, map to servo pulse width range 1000–2000 µs
+// ADC is 12-bit: 0–4095, mapped to per-axis pulse width ranges below
 static constexpr int ADC_MIN = 0;
 static constexpr int ADC_MAX = 4095;
-static constexpr int PULSE_MIN = 550;  // microseconds (0°)
-static constexpr int PULSE_MAX = 2650; // microseconds (180°)
+static constexpr int PAN_PULSE_MIN = 950;   // microseconds
+static constexpr int PAN_PULSE_MAX = 2130;  // microseconds
+static constexpr int TILT_PULSE_MIN = 1000; // microseconds
+static constexpr int TILT_PULSE_MAX = 1500; // microseconds
 
 // Moving average filter to reduce noise (number of samples to average)
-static constexpr int FILTER_SIZE = 21;
+static constexpr int FILTER_SIZE = 9;
 
-// Shorter moving average after the deadband to smooth the final output.
-static constexpr int OUTPUT_FILTER_SIZE = 21;
+// Secondary moving average after deadband to smooth the final output.
+static constexpr int OUTPUT_FILTER_SIZE = 9;
 
 // Deadband in pulse-width units: the output must move by at least this much
 // before the transmitter treats it as a real change.
@@ -53,8 +55,8 @@ static constexpr int DEADBAND_US = 8;
 // ---------------------------------------------------------------------------
 typedef struct __attribute__((packed))
 {
-    uint16_t pan_us;  // 1000–2000 microseconds (pulse width)
-    uint16_t tilt_us; // 1000–2000 microseconds (pulse width)
+    uint16_t pan_us;  // intended for receiver PAN range (PAN_MIN_US..PAN_MAX_US)
+    uint16_t tilt_us; // intended for receiver TILT range (TILT_MIN_US..TILT_MAX_US)
 } PanTiltPacket;
 
 // ---------------------------------------------------------------------------
@@ -158,15 +160,15 @@ DeadbandFilter tiltDeadband;
 OutputMovingAverageFilter panOutputFilter;
 OutputMovingAverageFilter tiltOutputFilter;
 
-// Map raw ADC value (0-4095) to servo pulse width (1000-2000 µs).
-uint16_t adcToPulseWidth(int raw)
+// Map raw ADC value (0-4095) to servo pulse width using provided limits.
+uint16_t adcToPulseWidth(int raw, int pulseMin, int pulseMax)
 {
     // Constrain to valid ADC range
     raw = constrain(raw, ADC_MIN, ADC_MAX);
 
-    // Linear mapping: ADC_MIN → PULSE_MIN, ADC_MAX → PULSE_MAX
-    int pulseWidth = map(raw, ADC_MIN, ADC_MAX, PULSE_MIN, PULSE_MAX);
-    return (uint16_t)constrain(pulseWidth, PULSE_MIN, PULSE_MAX);
+    // Linear mapping: ADC_MIN → pulseMin, ADC_MAX → pulseMax
+    int pulseWidth = map(raw, ADC_MIN, ADC_MAX, pulseMin, pulseMax);
+    return (uint16_t)constrain(pulseWidth, pulseMin, pulseMax);
 }
 
 // ESP-NOW send callback — logs errors if the peer did not acknowledge.
@@ -186,7 +188,7 @@ void setup()
     Serial.begin(115200);
     delay(500);
 
-    // ADC pins (14, 15) are input; no pinMode needed, but we can set them anyway
+    // ADC pins (34, 35) are inputs; no pinMode needed, but set explicitly for clarity
     pinMode(PIN_POT_PAN, INPUT);
     pinMode(PIN_POT_TILT, INPUT);
 
@@ -239,8 +241,8 @@ void loop()
     int filteredPan = panFilter.update(rawPan);
     int filteredTilt = tiltFilter.update(rawTilt);
 
-    int panStableUs = panDeadband.update(adcToPulseWidth(filteredPan));
-    int tiltStableUs = tiltDeadband.update(adcToPulseWidth(filteredTilt));
+    int panStableUs = panDeadband.update(adcToPulseWidth(filteredPan, PAN_PULSE_MIN, PAN_PULSE_MAX));
+    int tiltStableUs = tiltDeadband.update(adcToPulseWidth(filteredTilt, TILT_PULSE_MIN, TILT_PULSE_MAX));
 
     uint16_t panUs = (uint16_t)panOutputFilter.update(panStableUs);
     uint16_t tiltUs = (uint16_t)tiltOutputFilter.update(tiltStableUs);
@@ -252,6 +254,6 @@ void loop()
 
     esp_now_send(RECEIVER_MAC, (uint8_t *)&pkt, sizeof(pkt));
 
-    Serial.printf("[TX] raw=(%4d,%4d) filt=(%4d,%4d) stable=(%4d,%4d) out=(%4d,%4d)\n",
-                  rawPan, rawTilt, filteredPan, filteredTilt, panStableUs, tiltStableUs, panUs, tiltUs);
+    Serial.printf("rawPan:%d\trawTilt:%d\tfinalPan:%u\tfinalTilt:%u\n",
+                  rawPan, rawTilt, panUs, tiltUs);
 }

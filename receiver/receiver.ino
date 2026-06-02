@@ -2,7 +2,7 @@
  * receiver.ino — ESP32 Pan-Tilt Head Receiver
  *
  * Receives PanTiltPacket via ESP-NOW from the transmitter and drives
- * two servos to the specified positions directly (potentiometer control).
+ * two servos by directly writing received pulse widths.
  * Turns on blue built-in LED when connected.
  *
  * SETUP:
@@ -32,8 +32,15 @@ static constexpr int PIN_PAN = 14;
 static constexpr int PIN_TILT = 15;
 static constexpr int PIN_LED = 2; // Built-in LED
 
+static constexpr int PAN_MIN_US = 950;
+static constexpr int PAN_MAX_US = 2130;
+static constexpr int TILT_MIN_US = 1000;
+static constexpr int TILT_MAX_US = 1500;
+static constexpr int PAN_CENTER_US = 1550;
+static constexpr int TILT_CENTER_US = (TILT_MIN_US + TILT_MAX_US) / 2;
+
 // ---------------------------------------------------------------------------
-// Receiver MAC address (hardcoded)
+// Receiver MAC reference printed at startup for manual verification
 // ---------------------------------------------------------------------------
 static const uint8_t RECEIVER_MAC[6] = {0x08, 0xB6, 0x1F, 0xB8, 0xA3, 0xD0};
 
@@ -42,8 +49,8 @@ static const uint8_t RECEIVER_MAC[6] = {0x08, 0xB6, 0x1F, 0xB8, 0xA3, 0xD0};
 // ---------------------------------------------------------------------------
 typedef struct __attribute__((packed))
 {
-    uint16_t pan_us;  // 1000–2000 microseconds (pulse width)
-    uint16_t tilt_us; // 1000–2000 microseconds (pulse width)
+    uint16_t pan_us;  // constrained to PAN_MIN_US..PAN_MAX_US on receive
+    uint16_t tilt_us; // constrained to TILT_MIN_US..TILT_MAX_US on receive
 } PanTiltPacket;
 
 // ---------------------------------------------------------------------------
@@ -102,10 +109,10 @@ void setup()
     Serial.println("[Receiver] ESP-NOW ready, waiting for packets...");
 
     // Attach servos
-    panServo.attach(PIN_PAN, 550, 2650);
-    tiltServo.attach(PIN_TILT, 550, 2650);
-    panServo.writeMicroseconds(1600); // Center position (1500 µs = 90°)
-    tiltServo.writeMicroseconds(1600);
+    panServo.attach(PIN_PAN, PAN_MIN_US, PAN_MAX_US);
+    tiltServo.attach(PIN_TILT, TILT_MIN_US, TILT_MAX_US);
+    panServo.writeMicroseconds(PAN_CENTER_US);
+    tiltServo.writeMicroseconds(TILT_CENTER_US);
 
     lastPacketMs = millis();
 }
@@ -145,8 +152,8 @@ void loop()
         interrupts();
 
         // Constrain pulse widths to valid servo range
-        uint16_t panUs = constrain(pkt.pan_us, 550, 2650);
-        uint16_t tiltUs = constrain(pkt.tilt_us, 550, 2650);
+        uint16_t panUs = constrain(pkt.pan_us, PAN_MIN_US, PAN_MAX_US);
+        uint16_t tiltUs = constrain(pkt.tilt_us, TILT_MIN_US, TILT_MAX_US);
 
         panServo.writeMicroseconds(panUs);
         tiltServo.writeMicroseconds(tiltUs);
